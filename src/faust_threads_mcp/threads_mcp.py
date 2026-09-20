@@ -1,49 +1,40 @@
-"""Portable official Threads API MCP server.
-
-Only graph.threads.com/v1.0 is reachable. Reads follow cursors, never provider ``next`` URLs.
-Writes are disabled unless explicitly enabled and carry an author approval receipt.
-"""
+"""Standalone MCP server for the official Threads API."""
 
 import asyncio
-import base64
-import binascii
-import contextlib
-import hashlib
-import hmac
 import json
 import os
+import random
 import re
-import sys
-import tempfile
-import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Callable
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, Tool
+from mcp.types import CallToolResult, Tool, ToolAnnotations
 
 API_BASE = "https://graph.threads.com/v1.0"
 SERVER_NAME = "faust-threads-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 POST_METRICS = ("views", "likes", "replies", "reposts", "quotes", "shares")
 USER_METRICS = ("views", "likes", "replies", "reposts", "quotes", "clicks", "followers_count")
 BREAKDOWNS = ("country", "city", "age", "gender")
 MAX_PAGES = 100
 MAX_ITEMS = 5000
 MAX_BODY = 4 * 1024 * 1024
-MAX_APPROVALS_PER_ACCOUNT_DAY = 20
-
+MAX_RETRIES = 2
+STATUS_MAX_POLLS = 10
+STATUS_POLL_DELAY = 1.0
+MEDIA_TYPES = ("TEXT", "IMAGE", "VIDEO", "CAROUSEL")
+REPLY_CONTROLS = ("everyone", "accounts_you_follow", "mentioned_only")
 Json = dict[str, Any]
 Requester = Callable[..., Json]
-_LEDGER_LOCK = threading.Lock()
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -76,8 +67,56 @@ def _cursor(value: Any) -> str | None:
     return value
 
 
-def request(method: str, path: str, params: dict[str, Any], body: Json | None = None) -> Json:
-    """Perform one official API request; errors never include tokens or response bodies."""
+class _Cache:
+    def __init__(
+        self, ttl: float, capacity: int, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self.ttl, self.capacity, self.clock = ttl, capacity, clock
+        self.values: OrderedDict[str, tuple[float, Json]] = OrderedDict()
+
+    def get(self, key: str) -> Json | None:
+        item = self.values.get(key)
+        if item is None:
+            return None
+        if self.clock() - item[0] >= self.ttl:
+            self.values.pop(key, None)
+            return None
+        self.values.move_to_end(key)
+        return item[1]
+
+    def put(self, key: str, value: Json) -> None:
+        self.values[key] = (self.clock(), value)
+        self.values.move_to_end(key)
+        while len(self.values) > self.capacity:
+            self.values.popitem(last=False)
+
+    def invalidate(self) -> None:
+        self.values.clear()
+
+
+_CACHE = _Cache(
+    float(os.environ.get("THREADS_CACHE_TTL", "0")),
+    int(os.environ.get("THREADS_CACHE_SIZE", "128")),
+)
+
+
+def _retry_delay(headers: Any, attempt: int) -> float:
+    try:
+        retry_after = float(headers.get("Retry-After", ""))
+        return min(max(retry_after, 0), 30)
+    except (AttributeError, TypeError, ValueError):
+        return float(min(2**attempt + random.random(), 30))  # nosec B311 - jitter only
+
+
+def request(
+    method: str,
+    path: str,
+    params: dict[str, Any],
+    body: Json | None = None,
+    *,
+    use_cache: bool = True,
+) -> Json:
+    """Perform one API request. Only idempotent GET requests are retried."""
     url = API_BASE + _path(path)
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     if query:
@@ -94,25 +133,40 @@ def request(method: str, path: str, params: dict[str, Any], body: Json | None = 
             "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}",
         },
     )
-    try:
-        opener = urllib.request.build_opener(_RejectRedirects)
-        with opener.open(req, timeout=30) as response:  # nosec B310 - URL is fixed to Meta API
-            raw = response.read(MAX_BODY + 1)
-    except RuntimeError:
-        raise
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Threads API returned HTTP {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise RuntimeError("Threads API connection failed") from None
-    if len(raw) > MAX_BODY:
-        raise RuntimeError("Threads API response exceeded size limit")
-    try:
-        result = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        raise RuntimeError("Threads API returned non-JSON") from None
-    if not isinstance(result, dict) or "error" in result:
-        raise RuntimeError("Threads API returned an error")
-    return result
+    key = url
+    if method == "GET" and use_cache and _CACHE.ttl > 0:
+        cached = _CACHE.get(key)
+        if cached is not None:
+            return cached
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with urllib.request.build_opener(_RejectRedirects).open(req, timeout=30) as response:  # nosec B310 - fixed API base
+                raw = response.read(MAX_BODY + 1)
+            if len(raw) > MAX_BODY:
+                raise RuntimeError("Threads API response exceeded size limit")
+            result = json.loads(raw)
+            if not isinstance(result, dict) or "error" in result:
+                raise RuntimeError("Threads API returned an error")
+            if method == "GET" and use_cache and _CACHE.ttl > 0:
+                _CACHE.put(key, result)
+            return result
+        except urllib.error.HTTPError as exc:
+            if method == "GET" and exc.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                time.sleep(_retry_delay(exc.headers, attempt))
+                continue
+            raise RuntimeError(f"Threads API returned HTTP {exc.code}") from None
+        except RuntimeError:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if method == "GET" and attempt < MAX_RETRIES:
+                time.sleep(_retry_delay({}, attempt))
+                continue
+            raise RuntimeError("Threads API connection failed") from None
+        except (ValueError, UnicodeDecodeError):
+            raise RuntimeError("Threads API returned non-JSON") from None
+    raise RuntimeError(
+        "Threads API connection failed"
+    )  # pragma: no cover - loop always returns or raises
 
 
 def _page(path: str, params: dict[str, Any], *, pages: int, limit: int, get: Requester) -> Json:
@@ -121,11 +175,11 @@ def _page(path: str, params: dict[str, Any], *, pages: int, limit: int, get: Req
     rows: list[Any] = []
     seen_ids: set[str] = set()
     cursor: str | None = None
-    used_cursors: set[str] = set()
-    complete: bool | None = None
-    used_pages = 0
+    used: set[str] = set()
     warnings: list[str] = []
     errors: list[str] = []
+    complete: bool | None = None
+    used_pages = 0
     for _ in range(pages):
         used_pages += 1
         query = dict(params)
@@ -136,7 +190,6 @@ def _page(path: str, params: dict[str, Any], *, pages: int, limit: int, get: Req
         data = payload.get("data")
         if not isinstance(data, list):
             errors.append("response data is not a list")
-            complete = None
             break
         for row in data:
             row_id = row.get("id") if isinstance(row, dict) else None
@@ -150,28 +203,21 @@ def _page(path: str, params: dict[str, Any], *, pages: int, limit: int, get: Req
             complete = False
             break
         paging = payload.get("paging")
-        if not isinstance(paging, dict):
-            warnings.append("paging is missing or malformed; completeness is unknown")
-            complete = None
-            break
-        cursors = paging.get("cursors")
+        cursors = paging.get("cursors") if isinstance(paging, dict) else None
         if not isinstance(cursors, dict):
-            warnings.append("paging.cursors is missing or malformed; completeness is unknown")
-            complete = None
+            warnings.append("paging is missing or malformed; completeness is unknown")
             break
         candidate = _cursor(cursors.get("after"))
         if candidate is None:
             complete = True
             break
-        if candidate in used_cursors or candidate == cursor:
+        if candidate in used or candidate == cursor:
             errors.append("pagination cursor cycle detected; completeness is unknown")
-            complete = None
             break
-        used_cursors.add(candidate)
+        used.add(candidate)
         cursor = candidate
     else:
         warnings.append("page limit reached; completeness is unknown")
-        complete = None
     return {
         "data": rows[:limit],
         "coverage": {
@@ -186,6 +232,12 @@ def _page(path: str, params: dict[str, Any], *, pages: int, limit: int, get: Req
     }
 
 
+def _numeric(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"\d+", value):
+        raise ValueError(f"{name} must be a numeric Threads id")
+    return value
+
+
 def latest_posts(args: Json, get: Requester = request) -> Json:
     result = _page(
         "/me/threads",
@@ -198,10 +250,63 @@ def latest_posts(args: Json, get: Requester = request) -> Json:
     return result
 
 
+def profile(args: Json, get: Requester = request) -> Json:
+    raw_user_id = args.get("user_id")
+    user_id = "/me" if raw_user_id is None else "/" + _numeric(raw_user_id, "user_id")
+    result = get(
+        "GET",
+        user_id,
+        {"fields": "id,username,name,threads_profile_picture_url,threads_biography"},
+    )
+    return {"data": result, "source": f"Meta Threads API {user_id}"}
+
+
+def post(args: Json, get: Requester = request) -> Json:
+    post_id = _numeric(args.get("post_id"), "post_id")
+    return {
+        "data": get(
+            "GET",
+            f"/{post_id}",
+            {
+                "fields": "id,username,text,media_type,permalink,timestamp,has_replies,root_post,replied_to"
+            },
+        ),
+        "source": f"Meta Threads API /{post_id}",
+    }
+
+
+def replies(args: Json, get: Requester = request) -> Json:
+    post_id = _numeric(args.get("post_id"), "post_id")
+    return _page(
+        f"/{post_id}/replies",
+        {"fields": "id,text,username,timestamp,has_replies"},
+        pages=int(args.get("pages", 10)),
+        limit=int(args.get("limit", 50)),
+        get=get,
+    )
+
+
+def conversation(args: Json, get: Requester = request) -> Json:
+    post_id = _numeric(args.get("post_id"), "post_id")
+    return _page(
+        f"/{post_id}/conversation",
+        {"fields": "id,text,username,timestamp,has_replies"},
+        pages=int(args.get("pages", 10)),
+        limit=int(args.get("limit", 50)),
+        get=get,
+    )
+
+
+def discover(args: Json, get: Requester = request) -> Json:
+    username = args.get("username")
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", username):
+        raise ValueError("username must contain only letters, digits, underscores, or dots")
+    path = "/profile_posts" if args.get("posts", True) else "/profile_lookup"
+    return {"data": get("GET", path, {"username": username}), "source": f"Meta Threads API {path}"}
+
+
 def post_insights(args: Json, get: Requester = request) -> Json:
-    post_id = args.get("post_id")
-    if not isinstance(post_id, str) or not re.fullmatch(r"\d+", post_id):
-        raise ValueError("post_id must be a numeric Threads media id")
+    post_id = _numeric(args.get("post_id"), "post_id")
     result = get("GET", f"/{post_id}/insights", {"metric": ",".join(POST_METRICS)})
     return {
         "data": result.get("data", []),
@@ -217,24 +322,24 @@ def account_insights(args: Json, get: Requester = request) -> Json:
     metrics = args.get("metrics", list(USER_METRICS))
     if not isinstance(metrics, list) or not metrics or any(x not in USER_METRICS for x in metrics):
         raise ValueError(f"metrics must contain only {list(USER_METRICS)}")
-    since = args.get("since")
-    until = args.get("until")
-    windowed = [metric for metric in metrics if metric != "followers_count"]
-    lifetime = [metric for metric in metrics if metric == "followers_count"]
+    since, until = args.get("since"), args.get("until")
+    windowed = [x for x in metrics if x != "followers_count"]
+    lifetime = [x for x in metrics if x == "followers_count"]
     data: list[Any] = []
     windows: dict[str, Json] = {}
     if windowed:
-        result = get(
-            "GET",
-            "/me/threads_insights",
-            {"metric": ",".join(windowed), "since": since, "until": until},
+        data.extend(
+            get(
+                "GET",
+                "/me/threads_insights",
+                {"metric": ",".join(windowed), "since": since, "until": until},
+            ).get("data", [])
         )
-        data.extend(result.get("data", []))
-        for metric in windowed:
-            windows[metric] = {"since": since, "until": until}
+        windows.update({x: {"since": since, "until": until} for x in windowed})
     if lifetime:
-        result = get("GET", "/me/threads_insights", {"metric": "followers_count"})
-        data.extend(result.get("data", []))
+        data.extend(
+            get("GET", "/me/threads_insights", {"metric": "followers_count"}).get("data", [])
+        )
         windows["followers_count"] = {
             "since": None,
             "until": None,
@@ -247,7 +352,7 @@ def account_insights(args: Json, get: Requester = request) -> Json:
         "coverage": {
             "requested": metrics,
             "returned": returned,
-            "missing": [m for m in metrics if m not in returned],
+            "missing": [x for x in metrics if x not in returned],
             "windows": windows,
         },
     }
@@ -271,267 +376,329 @@ def demographics(args: Json, get: Requester = request) -> Json:
     }
 
 
-def _approval_payload(receipt: Json) -> str:
-    fields = {
-        "approval_id": receipt.get("approval_id"),
-        "account_id": receipt.get("account_id"),
-        "reply_to_id": receipt.get("reply_to_id"),
-        "text_sha256": receipt.get("text_sha256"),
-        "expires_at": receipt.get("expires_at"),
-        "nonce": receipt.get("nonce"),
-    }
-    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+def _required_id(args: Json, key: str) -> str:
+    return _numeric(args.get(key), key)
 
 
-def _ledger_path() -> Path:
-    return Path(
-        os.environ.get(
-            "THREADS_APPROVAL_LEDGER",
-            Path(tempfile.gettempdir()) / "faust-threads-approval-ledger.json",
-        )
-    )
+def _optional_id(args: Json, key: str) -> str | None:
+    value = args.get(key)
+    return None if value is None else _numeric(value, key)
 
 
-def _write_ledger(ledger: list[Json]) -> None:
-    path = _ledger_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=".approval-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(ledger, handle, sort_keys=True, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
+def _validate_text(text: Any) -> str:
+    if not isinstance(text, str) or not 1 <= len(text) <= 500:
+        raise ValueError("text must be 1..500 characters")
+    return text
 
 
-@contextlib.contextmanager
-def _ledger_file_lock() -> Any:
-    """Serialize ledger read/modify/write across processes on Windows and POSIX."""
-    lock_path = Path(f"{_ledger_path()}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as handle:
-        if sys.platform == "win32":
-            import msvcrt
-
-            handle.seek(0)
-            handle.write(b"0")
-            handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _write_guard(args: Json) -> None:
-    if os.environ.get("THREADS_ENABLE_WRITES") != "1":
-        raise RuntimeError("writes are disabled; set THREADS_ENABLE_WRITES=1 explicitly")
-    text = args.get("text")
-    account_id = args.get("user_id")
-    reply_to_id = args.get("reply_to_id")
-    if (
-        not isinstance(text, str)
-        or not isinstance(account_id, str)
-        or not re.fullmatch(r"\d+", account_id)
-    ):
-        raise ValueError("approval binding requires a numeric user_id and text")
-    if reply_to_id is not None and (
-        not isinstance(reply_to_id, str) or not re.fullmatch(r"\d+", reply_to_id)
-    ):
-        raise ValueError("approval binding has an invalid reply target")
-    receipt = args.get("approval_receipt")
-    secret = os.environ.get("THREADS_APPROVAL_SECRET", "")
-    required = (
-        "approval_id",
-        "account_id",
-        "reply_to_id",
-        "text_sha256",
-        "expires_at",
-        "nonce",
-        "signature",
-    )
-    if (
-        not secret
-        or not isinstance(receipt, dict)
-        or any(not isinstance(receipt.get(key), str) for key in required)
-    ):
-        raise RuntimeError("trusted external approval receipt is required")
-    if receipt["account_id"] != account_id or receipt["reply_to_id"] != (reply_to_id or ""):
-        raise RuntimeError("approval receipt is bound to a different account or reply target")
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(receipt["text_sha256"], digest):
-        raise RuntimeError("approval receipt is bound to different text")
-    try:
-        expires = datetime.fromisoformat(receipt["expires_at"])
-    except ValueError:
-        raise RuntimeError("approval receipt expiry is invalid") from None
-    if expires.tzinfo is None or expires <= datetime.now(UTC):
-        raise RuntimeError("approval receipt is expired")
-    expected = hmac.new(
-        secret.encode("utf-8"), _approval_payload(receipt).encode(), hashlib.sha256
-    ).digest()
-    try:
-        supplied = base64.urlsafe_b64decode(receipt["signature"] + "===")
-    except (ValueError, binascii.Error):
-        raise RuntimeError("approval receipt signature is invalid") from None
-    if not hmac.compare_digest(expected, supplied):
-        raise RuntimeError("approval receipt signature is invalid")
-    now = datetime.now(UTC).isoformat()
-    with _LEDGER_LOCK, _ledger_file_lock():
-        try:
-            ledger = json.loads(_ledger_path().read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            ledger = []
-        if not isinstance(ledger, list) or any(not isinstance(item, dict) for item in ledger):
-            raise RuntimeError("approval ledger is invalid")
-        if any(item.get("approval_id") == receipt["approval_id"] for item in ledger):
-            raise RuntimeError("approval receipt has already been used")
-        day = now[:10]
-        used_today = sum(
-            1
-            for item in ledger
-            if item.get("account_id") == account_id and str(item.get("used_at", "")).startswith(day)
-        )
-        if used_today >= MAX_APPROVALS_PER_ACCOUNT_DAY:
-            raise RuntimeError("daily write quota exceeded")
-        ledger.append(
-            {"approval_id": receipt["approval_id"], "account_id": account_id, "used_at": now}
-        )
-        _write_ledger(ledger)
-
-
-def publish(args: Json, get: Requester = request, *, _guarded: bool = False) -> Json:
-    if not _guarded:
-        _write_guard(args)
-    text = args.get("text")
-    user_id = args.get("user_id")
-    if (
-        not isinstance(text, str)
-        or not 1 <= len(text) <= 500
-        or not isinstance(user_id, str)
-        or not re.fullmatch(r"\d+", user_id)
-    ):
-        raise ValueError("user_id must be numeric and text must be 1..500 characters")
-    container = get(
-        "POST",
-        f"/{user_id}/threads",
-        {"media_type": "TEXT", "text": text},
-        {"media_type": "TEXT", "text": text},
-    )
-    creation_id = container.get("id")
+def _create(user_id: str, fields: Json, get: Requester) -> str:
+    result = get("POST", f"/{user_id}/threads", fields, fields)
+    creation_id = result.get("id")
     if not isinstance(creation_id, str) or not re.fullmatch(r"\d+", creation_id):
         raise RuntimeError("publish container response did not contain a valid id")
+    return creation_id
+
+
+def _fresh_status(creation_id: str, get: Requester) -> Json:
+    params = {"fields": "id,status,error_message"}
+    return (
+        request("GET", f"/{creation_id}", params, use_cache=False)
+        if get is request
+        else get("GET", f"/{creation_id}", params)
+    )
+
+
+def _wait_for_container(user_id: str, creation_id: str, get: Requester) -> Json:
+    del user_id
+    last: Json = {}
+    for attempt in range(STATUS_MAX_POLLS):
+        last = _fresh_status(creation_id, get)
+        state = last.get("status")
+        if state == "FINISHED":
+            return {"status": "finished", "container": {"id": creation_id}}
+        if state == "PUBLISHED":
+            return {"status": "published", "container": {"id": creation_id}}
+        if state in ("ERROR", "EXPIRED"):
+            return {
+                "status": state.lower(),
+                "container": {"id": creation_id},
+                "error": last.get("error_message") or f"container status is {state}",
+            }
+        if attempt + 1 < STATUS_MAX_POLLS:
+            time.sleep(STATUS_POLL_DELAY)
+    return {
+        "status": "timeout",
+        "container": {"id": creation_id},
+        "error": f"container did not reach FINISHED within {STATUS_MAX_POLLS} polls",
+    }
+
+
+def _validate_write_options(args: Json) -> None:
+    for key in ("reply_to_id", "quote_post_id"):
+        _optional_id(args, key)
+    if args.get("reply_control") is not None and args["reply_control"] not in REPLY_CONTROLS:
+        raise ValueError(f"reply_control must be one of {list(REPLY_CONTROLS)}")
+    for key in ("topic_tag", "alt_text"):
+        if key in args and args[key] is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be a string")
+
+
+def _carousel_children(args: Json, user_id: str, get: Requester) -> list[str]:
+    children = args.get("children")
+    items = args.get("items")
+    if children is not None and items is not None:
+        raise ValueError("provide children or items, not both")
+    if isinstance(items, list):
+        if not 2 <= len(items) <= 20 or any(not isinstance(item, dict) for item in items):
+            raise ValueError("items must contain 2..20 media objects")
+        result: list[str] = []
+        for item in items:
+            item_type = item.get("media_type")
+            if item_type not in ("IMAGE", "VIDEO"):
+                raise ValueError("carousel items must be IMAGE or VIDEO")
+            key = "image_url" if item_type == "IMAGE" else "video_url"
+            url = item.get(key)
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                raise ValueError("media URL must be an absolute HTTP(S) URL")
+            result.append(
+                _create(user_id, {"media_type": item_type, key: url, "is_carousel_item": True}, get)
+            )
+        return result
+    if (
+        not isinstance(children, list)
+        or not 2 <= len(children) <= 20
+        or any(not isinstance(x, str) or not re.fullmatch(r"\d+", x) for x in children)
+    ):
+        raise ValueError("children must contain 2..20 numeric container ids")
+    return children
+
+
+def _publish_existing(user_id: str, creation_id: str, get: Requester) -> Json:
+    ready = _wait_for_container(user_id, creation_id, get)
+    if ready["status"] != "finished":
+        return ready
     published = get(
         "POST",
         f"/{user_id}/threads_publish",
         {"creation_id": creation_id},
         {"creation_id": creation_id},
     )
+    _CACHE.invalidate()
     return {"status": "published", "container": {"id": creation_id}, "result": published}
 
 
-def reply(args: Json, get: Requester = request) -> Json:
-    _write_guard(args)
-    args = dict(args)
-    args["text"] = args.get("text")
-    parent = args.get("reply_to_id")
-    return publish({**args, "reply_to_id": parent}, get, _guarded=True)
+def publish(args: Json, get: Requester = request) -> Json:
+    user_id = _required_id(args, "user_id")
+    media_type = args.get("media_type", "TEXT")
+    if media_type not in MEDIA_TYPES:
+        raise ValueError(f"media_type must be one of {list(MEDIA_TYPES)}")
+    _validate_write_options(args)
+    fields: Json = {"media_type": media_type}
+    if media_type == "TEXT":
+        fields["text"] = _validate_text(args.get("text"))
+    elif media_type in ("IMAGE", "VIDEO"):
+        key = "image_url" if media_type == "IMAGE" else "video_url"
+        url = args.get(key)
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            raise ValueError("media URL must be an absolute HTTP(S) URL")
+        fields[key] = url
+        if "text" in args:
+            fields["text"] = _validate_text(args["text"])
+    else:
+        fields["children"] = ",".join(_carousel_children(args, user_id, get))
+        if "text" in args:
+            fields["text"] = _validate_text(args["text"])
+    for key in ("reply_to_id", "reply_control", "quote_post_id", "topic_tag", "alt_text"):
+        if args.get(key) is not None:
+            fields[key] = args[key]
+    creation_id = _create(user_id, fields, get)
+    _CACHE.invalidate()
+    if args.get("stage_only"):
+        return {"status": "created", "container": {"id": creation_id}}
+    return _publish_existing(user_id, creation_id, get)
+
+
+def publish_container(args: Json, get: Requester = request) -> Json:
+    return _publish_existing(_required_id(args, "user_id"), _required_id(args, "creation_id"), get)
+
+
+def manage_reply(args: Json, get: Requester = request) -> Json:
+    reply_id = _required_id(args, "reply_id")
+    hidden = args.get("hide")
+    if not isinstance(hidden, bool):
+        raise TypeError("hide must be boolean")
+    result = get(
+        "POST",
+        f"/{reply_id}/manage_reply",
+        {"hide": str(hidden).lower()},
+        {"hide": str(hidden).lower()},
+    )
+    _CACHE.invalidate()
+    return {"status": "hidden" if hidden else "visible", "result": result}
+
+
+def _tool(
+    name: str,
+    description: str,
+    properties: Json,
+    required: list[str] | None = None,
+    *,
+    destructive: bool = False,
+) -> Tool:
+    schema: Json = {"type": "object", "properties": properties, "additionalProperties": False}
+    if required:
+        schema["required"] = required
+    annotations = ToolAnnotations(
+        readOnlyHint=not destructive,
+        destructiveHint=destructive,
+        idempotentHint=not destructive,
+    )
+    return Tool(name=name, description=description, inputSchema=schema, annotations=annotations)
 
 
 TOOLS = [
-    Tool(
-        name="threads_latest_posts",
-        description="Fetch real latest posts with cursor pagination.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 5000},
-                "pages": {"type": "integer", "minimum": 1, "maximum": 100},
+    _tool(
+        "threads_latest_posts",
+        "Read the authenticated user's posts with bounded cursor pagination.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ITEMS},
+            "pages": {"type": "integer", "minimum": 1, "maximum": MAX_PAGES},
+        },
+    ),
+    _tool(
+        "threads_get_profile",
+        "Read a Threads profile by numeric user id.",
+        {"user_id": {"type": "string", "pattern": "^[0-9]+$"}},
+    ),
+    _tool(
+        "threads_get_post",
+        "Read one Threads post by numeric media id.",
+        {"post_id": {"type": "string"}},
+        ["post_id"],
+    ),
+    _tool(
+        "threads_get_replies",
+        "Read replies to a post with bounded pagination.",
+        {"post_id": {"type": "string"}, "limit": {"type": "integer"}, "pages": {"type": "integer"}},
+        ["post_id"],
+    ),
+    _tool(
+        "threads_get_conversation",
+        "Read a post conversation with bounded pagination.",
+        {"post_id": {"type": "string"}, "limit": {"type": "integer"}, "pages": {"type": "integer"}},
+        ["post_id"],
+    ),
+    _tool(
+        "threads_profile_discovery",
+        "Look up a public profile or retrieve its posts by username.",
+        {"username": {"type": "string"}, "posts": {"type": "boolean"}},
+        ["username"],
+    ),
+    _tool(
+        "threads_post_insights",
+        "Read all documented media insight metrics.",
+        {"post_id": {"type": "string"}},
+        ["post_id"],
+    ),
+    _tool(
+        "threads_account_insights",
+        "Read documented account insights and coverage windows.",
+        {"metrics": {"type": "array"}, "since": {"type": "integer"}, "until": {"type": "integer"}},
+    ),
+    _tool(
+        "threads_follower_demographics",
+        "Read follower demographics for one documented breakdown.",
+        {"breakdown": {"type": "string", "enum": list(BREAKDOWNS)}},
+        ["breakdown"],
+    ),
+    _tool(
+        "threads_publish_post",
+        "Create and publish a text, media, or carousel post; use stage_only for a container-only command.",
+        {
+            "user_id": {"type": "string", "pattern": "^[0-9]+$"},
+            "media_type": {"type": "string", "enum": list(MEDIA_TYPES)},
+            "text": {"type": "string", "minLength": 1, "maxLength": 500},
+            "image_url": {"type": "string", "format": "uri"},
+            "video_url": {"type": "string", "format": "uri"},
+            "children": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9]+$"},
+                "minItems": 2,
+                "maxItems": 20,
             },
+            "items": {"type": "array", "minItems": 2, "maxItems": 20, "items": {"type": "object"}},
+            "reply_to_id": {"type": "string", "pattern": "^[0-9]+$"},
+            "reply_control": {"type": "string", "enum": list(REPLY_CONTROLS)},
+            "quote_post_id": {"type": "string", "pattern": "^[0-9]+$"},
+            "topic_tag": {"type": "string"},
+            "alt_text": {"type": "string"},
+            "stage_only": {"type": "boolean"},
         },
+        ["user_id"],
+        destructive=True,
     ),
-    Tool(
-        name="threads_post_insights",
-        description="Fetch all documented media insight metrics.",
-        inputSchema={
-            "type": "object",
-            "properties": {"post_id": {"type": "string"}},
-            "required": ["post_id"],
+    _tool(
+        "threads_publish_container",
+        "Publish an existing media container returned by stage_only.",
+        {
+            "user_id": {"type": "string", "pattern": "^[0-9]+$"},
+            "creation_id": {"type": "string", "pattern": "^[0-9]+$"},
         },
+        ["user_id", "creation_id"],
+        destructive=True,
     ),
-    Tool(
-        name="threads_account_insights",
-        description="Fetch documented user insights with explicit coverage and window.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "metrics": {"type": "array", "items": {"type": "string"}},
-                "since": {"type": "integer"},
-                "until": {"type": "integer"},
-            },
+    _tool(
+        "threads_publish_reply",
+        "Create and publish a reply using the official reply_to_id field.",
+        {
+            "user_id": {"type": "string"},
+            "reply_to_id": {"type": "string"},
+            "text": {"type": "string"},
         },
+        ["user_id", "reply_to_id", "text"],
+        destructive=True,
     ),
-    Tool(
-        name="threads_follower_demographics",
-        description="Fetch follower demographics for one documented breakdown.",
-        inputSchema={
-            "type": "object",
-            "properties": {"breakdown": {"type": "string", "enum": list(BREAKDOWNS)}},
-            "required": ["breakdown"],
-        },
-    ),
-    Tool(
-        name="threads_publish_post",
-        description="Publish only with explicit environment enablement and author approval receipt.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string"},
-                "text": {"type": "string"},
-                "approval_receipt": {"type": "object"},
-            },
-            "required": ["user_id", "text", "approval_receipt"],
-        },
-    ),
-    Tool(
-        name="threads_publish_reply",
-        description="Publish a reply only with explicit environment enablement and author approval receipt.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string"},
-                "reply_to_id": {"type": "string"},
-                "text": {"type": "string"},
-                "approval_receipt": {"type": "object"},
-            },
-            "required": ["user_id", "reply_to_id", "text", "approval_receipt"],
-        },
+    _tool(
+        "threads_manage_reply",
+        "Hide or unhide a reply using the official manage_reply endpoint.",
+        {"reply_id": {"type": "string"}, "hide": {"type": "boolean"}},
+        ["reply_id", "hide"],
+        destructive=True,
     ),
 ]
 
+_HANDLERS: dict[str, Callable[[Json, Requester], Json]] = {
+    "threads_latest_posts": latest_posts,
+    "threads_get_profile": profile,
+    "threads_get_post": post,
+    "threads_get_replies": replies,
+    "threads_get_conversation": conversation,
+    "threads_profile_discovery": discover,
+    "threads_post_insights": post_insights,
+    "threads_account_insights": account_insights,
+    "threads_follower_demographics": demographics,
+    "threads_publish_post": publish,
+    "threads_publish_container": publish_container,
+    "threads_publish_reply": lambda args, get: publish(
+        {**args, "reply_to_id": args.get("reply_to_id")}, get
+    ),
+    "threads_manage_reply": manage_reply,
+}
+
 
 def dispatch(name: str, args: Json, get: Requester = request) -> Json:
-    return {
-        "threads_latest_posts": latest_posts,
-        "threads_post_insights": post_insights,
-        "threads_account_insights": account_insights,
-        "threads_follower_demographics": demographics,
-        "threads_publish_post": publish,
-        "threads_publish_reply": reply,
-    }[name](args, get)
+    if name not in _HANDLERS:
+        raise KeyError(name)
+    tool = next(tool for tool in TOOLS if tool.name == name)
+    allowed = set(tool.inputSchema.get("properties", {}))
+    unknown = set(args) - allowed
+    if unknown:
+        raise ValueError(f"unknown parameters: {sorted(unknown)}")
+    required = set(tool.inputSchema.get("required", []))
+    missing = required - set(args)
+    if missing:
+        raise ValueError(f"missing required parameters: {sorted(missing)}")
+    return _HANDLERS[name](args, get)
 
 
 def build_server() -> Server:
@@ -544,8 +711,9 @@ def build_server() -> Server:
     @server.call_tool()  # type: ignore[untyped-decorator]
     async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         try:
-            value = dispatch(name, arguments)
-            return CallToolResult(content=[], structuredContent=value, isError=False)
+            return CallToolResult(
+                content=[], structuredContent=dispatch(name, arguments), isError=False
+            )
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             return CallToolResult(content=[], isError=True, structuredContent={"error": str(exc)})
 

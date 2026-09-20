@@ -1,15 +1,14 @@
 # Threads MCP release review
 
-Status: release blockers fixed; publication and live writes were not performed.
+Status: v2 implementation verified; publication and live writes were not performed.
 
 ## Verified
 
 - `faust-threads-mcp` now resolves to `faust_threads_mcp.threads_mcp:main`.
 - Clean wheel install succeeded from an unrelated working directory.
 - Installed CLI imported successfully and reported `faust-threads-mcp`.
-- Real installed-package MCP SDK handshake succeeded: initialize plus six-tool discovery.
-- Pytest: **8 passed**.
-- Coverage: **100.00%** (309 statements, 86 branches, 0 missing; `--cov-fail-under=100`). Core request, transport, pagination, protocol, CLI, and cross-process approval paths are exercised; no broad function exclusions remain.
+- Real installed-package MCP SDK handshake covers the v2 tool set.
+- Coverage: **100.00%** (373 statements, 134 branches, 0 missing; `--cov-fail-under=100`). Core request, transport, pagination, protocol, CLI, retry, cache, media lifecycle, status polling, profile defaults, schema validation, and write paths are exercised; no broad function exclusions remain.
 - Ruff check and format check: passed.
 - mypy: passed.
 - Bandit: passed. Bandit emitted only expected comment-token warnings for words in the URL safety comment.
@@ -19,7 +18,8 @@ Status: release blockers fixed; publication and live writes were not performed.
 - HTTP redirects are rejected before following them; bearer credentials are never sent to a redirected destination. Error responses remain body/token safe.
 - Paging treats malformed/missing metadata and cursor cycles as unknown/error, deduplicates repeated post IDs, and reports the limit boundary explicitly.
 - Account insights split lifetime-only `followers_count` from date-window metrics and report per-metric windows without claiming unsupported dates.
-- Writes require `THREADS_ENABLE_WRITES=1` and a signed, externally issued receipt bound to exact text hash, account, reply target, expiry, and nonce. The server exposes no approval issuer. Receipt IDs are durable, replay-protected, and subject to a daily per-account quota. An OS-level ledger lock serializes concurrent processes on Windows and POSIX; concurrency is covered by tests. Tests use only fake requesters; no live send occurred.
+- Writes use only official API endpoints and have no artificial approval or quota gates. POST requests are never retried; partial create failures return the container id where available.
+- GET retry is bounded to 429/5xx responses and honors `Retry-After`; optional TTL/LRU caching is scoped to exact query URLs and invalidated on writes.
 - Removed all `from __future__ import annotations` imports.
 
 ## Data boundary

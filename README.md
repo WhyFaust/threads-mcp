@@ -23,15 +23,21 @@ Configure an MCP client with stdio:
 }
 ```
 
-The package never prints tokens. API errors are redacted and provider `paging.next` URLs are never fetched or persisted; only validated `paging.cursors.after` values are followed. The approval ledger uses an OS file lock plus atomic replacement, so receipt consumption is serialized across concurrent processes on Windows and POSIX.
+The package never prints tokens. API errors are redacted and provider `paging.next` URLs are never fetched or persisted; only validated `paging.cursors.after` values are followed. GET requests have bounded 429/5xx retry with `Retry-After`; POST requests are never retried. Set `THREADS_CACHE_TTL` and `THREADS_CACHE_SIZE` to enable an in-process TTL/LRU cache; writes invalidate it.
 
 ## Tools
 
 - `threads_latest_posts`: real `/me/threads` posts, bounded cursor pagination, explicit completeness.
+- `threads_get_profile`: authenticated `/me` profile by default, or a numeric user id.
+- `threads_get_post`: single-post retrieval by numeric media id.
+- `threads_get_replies`, `threads_get_conversation`: bounded reply/conversation retrieval.
+- `threads_profile_discovery`: username lookup or profile-post discovery.
 - `threads_post_insights`: all documented media metrics: `views`, `likes`, `replies`, `reposts`, `quotes`, `shares`.
 - `threads_account_insights`: all documented user metrics: `views`, `likes`, `replies`, `reposts`, `quotes`, `clicks`, `followers_count`, with coverage and time-window metadata.
 - `threads_follower_demographics`: `country`, `city`, `age`, or `gender` breakdown. Meta requires one breakdown and at least 100 followers.
-- `threads_publish_post` / `threads_publish_reply`: disabled by default; require `THREADS_ENABLE_WRITES=1` plus a signed, externally issued, single-use approval receipt bound to exact text, account, reply target, and expiry. A reply uses the official `reply_to_id` flow.
+- `threads_publish_post`: official TEXT, IMAGE, VIDEO, and CAROUSEL (2–20 children) create → bounded status polling → publish workflow. `stage_only` returns a container id without publishing; `threads_publish_container` publishes that existing id later. Carousel `items` create IMAGE/VIDEO child containers with `is_carousel_item=true`; `children` accepts existing numeric container ids. Optional ids and `reply_control` are validated before any write. ERROR, EXPIRED, and timeout outcomes return the container id and never auto-retry POST.
+- `threads_publish_reply`: official `reply_to_id` publishing flow.
+- `threads_manage_reply`: official hide/unhide endpoint with a boolean `hide` field.
 
 Published-post editing is not exposed: the official API capability is not claimed and delete/repost is not substituted.
 
@@ -61,7 +67,7 @@ mypy src
 bandit -q -r src
 ```
 
-Tests use a mocked transport for all writes and validate an actual MCP SDK stdio client handshake/list/call, including cross-process receipt idempotency. No test sends a network write.
+Tests use a mocked transport for all API operations and validate an actual MCP SDK stdio client handshake/list/call. No test sends a network write.
 
 ## Licensing
 
