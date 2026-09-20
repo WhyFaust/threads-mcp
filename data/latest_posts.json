@@ -1,0 +1,13 @@
+{
+  "fixture": true,
+  "source": "synthetic test fixture; not an API snapshot",
+  "account": "fixture-account",
+  "posts": [
+    {
+      "id": "fixture-1",
+      "text": "Synthetic Threads MCP fixture post.",
+      "permalink": "https://example.invalid/fixture-1",
+      "timestamp": "2026-01-01T00:00:00+00:00"
+    }
+  ]
+}
