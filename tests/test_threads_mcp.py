@@ -239,6 +239,25 @@ def test_posix_ledger_lock_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert [operation for _, operation in calls] == [FakeFcntl.LOCK_EX, FakeFcntl.LOCK_UN]
 
 
+def test_windows_ledger_lock_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int, int]] = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(fd: int, operation: int, size: int) -> None:
+            calls.append((fd, operation, size))
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setenv("THREADS_APPROVAL_LEDGER", str(tmp_path / "ledger.json"))
+    with mod._ledger_file_lock():
+        pass
+    assert [operation for _, operation, _ in calls] == [FakeMsvcrt.LK_LOCK, FakeMsvcrt.LK_UNLCK]
+
+
 def test_internal_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("THREADS_ACCESS_TOKEN", raising=False)
     with pytest.raises(RuntimeError):
