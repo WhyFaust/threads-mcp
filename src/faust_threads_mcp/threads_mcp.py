@@ -19,9 +19,11 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, Tool, ToolAnnotations
 
+from faust_threads_mcp.publication_guard import RECEIPT_SCHEMA, run_approved_write
+
 API_BASE = "https://graph.threads.com/v1.0"
 SERVER_NAME = "faust-threads-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 POST_METRICS = ("views", "likes", "replies", "reposts", "quotes", "shares")
 USER_METRICS = ("views", "likes", "replies", "reposts", "quotes", "clicks", "followers_count")
 BREAKDOWNS = ("country", "city", "age", "gender")
@@ -414,10 +416,12 @@ def _wait_for_container(user_id: str, creation_id: str, get: Requester) -> Json:
     for attempt in range(STATUS_MAX_POLLS):
         last = _fresh_status(creation_id, get)
         state = last.get("status")
+        if last.get("id") != creation_id:
+            return {"status": "unverified_container", "container": {"id": creation_id}}
         if state == "FINISHED":
             return {"status": "finished", "container": {"id": creation_id}}
         if state == "PUBLISHED":
-            return {"status": "published", "container": {"id": creation_id}}
+            return {"status": "published_unverified", "container": {"id": creation_id}}
         if state in ("ERROR", "EXPIRED"):
             return {
                 "status": state.lower(),
@@ -451,7 +455,7 @@ def _carousel_children(args: Json, user_id: str, get: Requester) -> list[str]:
     if isinstance(items, list):
         if not 2 <= len(items) <= 20 or any(not isinstance(item, dict) for item in items):
             raise ValueError("items must contain 2..20 media objects")
-        result: list[str] = []
+        fields = []
         for item in items:
             item_type = item.get("media_type")
             if item_type not in ("IMAGE", "VIDEO"):
@@ -460,10 +464,8 @@ def _carousel_children(args: Json, user_id: str, get: Requester) -> list[str]:
             url = item.get(key)
             if not isinstance(url, str) or not url.startswith(("https://", "http://")):
                 raise ValueError("media URL must be an absolute HTTP(S) URL")
-            result.append(
-                _create(user_id, {"media_type": item_type, key: url, "is_carousel_item": True}, get)
-            )
-        return result
+            fields.append({"media_type": item_type, key: url, "is_carousel_item": True})
+        return [_create(user_id, item, get) for item in fields]
     if (
         not isinstance(children, list)
         or not 2 <= len(children) <= 20
@@ -474,16 +476,26 @@ def _carousel_children(args: Json, user_id: str, get: Requester) -> list[str]:
 
 
 def _publish_existing(user_id: str, creation_id: str, get: Requester) -> Json:
-    ready = _wait_for_container(user_id, creation_id, get)
+    try:
+        ready = _wait_for_container(user_id, creation_id, get)
+    except RuntimeError:
+        return {"status": "unverified_container", "container": {"id": creation_id}}
     if ready["status"] != "finished":
         return ready
-    published = get(
-        "POST",
-        f"/{user_id}/threads_publish",
-        {"creation_id": creation_id},
-        {"creation_id": creation_id},
-    )
-    _CACHE.invalidate()
+    try:
+        published = get(
+            "POST",
+            f"/{user_id}/threads_publish",
+            {"creation_id": creation_id},
+            {"creation_id": creation_id},
+        )
+    except RuntimeError:
+        return {"status": "unknown_publish", "container": {"id": creation_id}}
+    finally:
+        _CACHE.invalidate()
+    published_id = published.get("id")
+    if not isinstance(published_id, str) or not re.fullmatch(r"[0-9]+", published_id):
+        return {"status": "unknown_publish", "container": {"id": creation_id}}
     return {"status": "published", "container": {"id": creation_id}, "result": published}
 
 
@@ -505,9 +517,9 @@ def publish(args: Json, get: Requester = request) -> Json:
         if "text" in args:
             fields["text"] = _validate_text(args["text"])
     else:
-        fields["children"] = ",".join(_carousel_children(args, user_id, get))
         if "text" in args:
             fields["text"] = _validate_text(args["text"])
+        fields["children"] = ",".join(_carousel_children(args, user_id, get))
     for key in ("reply_to_id", "reply_control", "quote_post_id", "topic_tag", "alt_text"):
         if args.get(key) is not None:
             fields[key] = args[key]
@@ -545,6 +557,9 @@ def _tool(
     *,
     destructive: bool = False,
 ) -> Tool:
+    if destructive:
+        properties = {**properties, "approval_receipt": RECEIPT_SCHEMA}
+        required = [*(required or []), "approval_receipt"]
     schema: Json = {"type": "object", "properties": properties, "additionalProperties": False}
     if required:
         schema["required"] = required
@@ -698,7 +713,17 @@ def dispatch(name: str, args: Json, get: Requester = request) -> Json:
     missing = required - set(args)
     if missing:
         raise ValueError(f"missing required parameters: {sorted(missing)}")
-    return _HANDLERS[name](args, get)
+    handler = _HANDLERS[name]
+    if tool.annotations and tool.annotations.destructiveHint:
+        body = {key: value for key, value in args.items() if key != "approval_receipt"}
+
+        def fresh(method: str, path: str, params: Json, data: Json | None) -> Json:
+            return request(method, path, params, data, use_cache=False)
+
+        return run_approved_write(
+            name, body, args["approval_receipt"], handler, fresh if get is request else get
+        )
+    return handler(args, get)
 
 
 def build_server() -> Server:
@@ -711,8 +736,9 @@ def build_server() -> Server:
     @server.call_tool()  # type: ignore[untyped-decorator]
     async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         try:
+            result = dispatch(name, arguments)
             return CallToolResult(
-                content=[], structuredContent=dispatch(name, arguments), isError=False
+                content=[], structuredContent=result, isError=result.get("queue") == "held"
             )
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             return CallToolResult(content=[], isError=True, structuredContent={"error": str(exc)})

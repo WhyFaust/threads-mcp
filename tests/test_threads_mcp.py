@@ -50,7 +50,7 @@ def test_reads_and_paging():
     assert m.demographics({"breakdown": "country"}, fake)["coverage"]["breakdown"] == "country"
 
 
-def test_publish_media_reply_and_manage():
+def test_publish_media_reply_and_manage(signed_write):
     assert (
         m.publish({"user_id": "1", "text": "hello", "stage_only": True}, fake)["status"]
         == "created"
@@ -74,12 +74,8 @@ def test_publish_media_reply_and_manage():
         ]
         == "published"
     )
-    assert (
-        m.dispatch(
-            "threads_publish_reply", {"user_id": "1", "reply_to_id": "2", "text": "r"}, fake
-        )["status"]
-        == "published"
-    )
+    reply = signed_write("threads_publish_reply", {"user_id": "1", "reply_to_id": "2", "text": "r"})
+    assert m.dispatch("threads_publish_reply", reply, fake)["status"] == "published"
     assert m.manage_reply({"reply_id": "2", "hide": True}, fake)["status"] == "hidden"
     assert m.manage_reply({"reply_id": "2", "hide": False}, fake)["status"] == "visible"
 
@@ -263,11 +259,7 @@ def test_remaining_boundaries(monkeypatch):
     assert (
         m.publish(
             {"user_id": "1", "text": "x"},
-            lambda method, path, params, body=None: (
-                {"id": "99", "status": "IN_PROGRESS"}
-                if method == "POST"
-                else {"status": "IN_PROGRESS"}
-            ),
+            lambda method, path, params, body=None: {"id": "99", "status": "IN_PROGRESS"},
         )["status"]
         == "timeout"
     )
@@ -414,9 +406,9 @@ def test_release_blockers_are_explicit(monkeypatch):
     )
     published = m.publish_container(
         {"user_id": "1", "creation_id": "77"},
-        lambda method, path, params, body=None: {"status": "PUBLISHED"},
+        lambda method, path, params, body=None: {"id": "77", "status": "PUBLISHED"},
     )
-    assert published["status"] == "published"
+    assert published["status"] == "published_unverified"
     assert (
         m.profile({}, lambda method, path, params, body=None: {"id": path})["data"]["id"] == "/me"
     )
@@ -436,8 +428,8 @@ def test_carousel_items_use_official_flag(monkeypatch):
         if method == "POST" and path == "/1/threads":
             return {"id": str(10 + len([x for x in seen if x[0] == "POST"]))}
         if method == "GET":
-            return {"status": "FINISHED"}
-        return {"ok": True}
+            return {"id": path.strip("/"), "status": "FINISHED"}
+        return {"id": "100"}
 
     result = m.publish(
         {
